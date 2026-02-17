@@ -390,9 +390,10 @@ def train_clip_with_split(
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
-        num_workers=2,
+        num_workers=0,          # avoids multiprocessing worker errors in notebooks
         collate_fn=collate_fn,
         pin_memory=(device == "cuda"),
+        persistent_workers=False,
     )
 
     val_batches = build_val_batches(
@@ -413,9 +414,12 @@ def train_clip_with_split(
 
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # Default scheduler: cosine warm restarts (better than plain cosine for long runs)
+    # Default: plain cosine decay.
+    # cosine_wr caused NaN explosions because the restart spikes LR back to 1e-3
+    # on a model that had already converged. Use cosine, or pass cosine_wr with
+    # a reduced lr (e.g. lr=3e-4) to keep restarts safe.
     if scheduler_cfg is None:
-        scheduler_cfg = {"name": "cosine_wr", "T_0": 30, "T_mult": 2, "eta_min": 1e-6}
+        scheduler_cfg = {"name": "cosine", "T_max": epochs, "eta_min": 1e-6}
 
     base_scheduler, sched_step = make_scheduler(
         opt,
@@ -445,10 +449,13 @@ def train_clip_with_split(
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
     best = {"val_score": -1.0, "mrr": -1.0, "state": None}
+    nan_strikes = 0          # consecutive NaN-contaminated epochs
+    MAX_NAN_STRIKES = 3
 
     for ep in range(1, epochs + 1):
         model.train()
         tot, n = 0.0, 0
+        nan_in_epoch = False
 
         for motions, texts in train_loader:
             if time_padding:
@@ -462,9 +469,24 @@ def train_clip_with_split(
                 motion_z = model(motions)
                 loss = clip_loss(motion_z, texts, model.logit_scale)
 
+            # ── NaN/Inf guard: check BEFORE backward so weights stay clean ────
+            if not torch.isfinite(loss):
+                nan_in_epoch = True
+                # Diagnose the source so we can fix it upstream
+                with torch.no_grad():
+                    mz_ok = torch.isfinite(motion_z).all().item()
+                    tz_ok = torch.isfinite(texts).all().item()
+                    ls_val = model.logit_scale.item()
+                print(f"  [NaN] ep={ep} | motion_z_finite={mz_ok} | "
+                      f"text_finite={tz_ok} | logit_scale={ls_val:.3f}")
+                opt.zero_grad(set_to_none=True)
+                # Reset scaler to avoid stale state after skipped backward
+                scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+                continue
+
             scaler.scale(loss).backward()
 
-            # FIX: gradient clipping (unscale first so clip operates on true grads)
+            # Gradient clipping (unscale first so clip operates on true grads)
             if grad_clip is not None:
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
@@ -472,7 +494,7 @@ def train_clip_with_split(
             scaler.step(opt)
             scaler.update()
 
-            # FIX: clamp logit_scale so temperature doesn't collapse
+            # Clamp logit_scale so temperature doesn't collapse
             with torch.no_grad():
                 model.logit_scale.clamp_(max=logit_scale_max)
 
@@ -483,6 +505,26 @@ def train_clip_with_split(
             n += 1
 
         train_loss = tot / max(n, 1)
+
+        # ── NaN epoch recovery: any NaN seen → reload best weights, halve LR ─
+        # We do this regardless of how many batches succeeded, because even one
+        # NaN loss means motion_z or logit_scale produced inf/nan outputs and
+        # the model state may already be partially corrupted.
+        if nan_in_epoch:
+            nan_strikes += 1
+            print(f"⚠️  NaN detected in epoch {ep} (strike {nan_strikes}/{MAX_NAN_STRIKES}). "
+                  f"Reloading best weights and halving LR.")
+            if best["state"] is not None:
+                model.load_state_dict(best["state"])
+                model = model.to(device)
+            for pg in opt.param_groups:
+                pg["lr"] = max(pg["lr"] * 0.5, 1e-7)
+            if nan_strikes >= MAX_NAN_STRIKES:
+                print("Too many NaN strikes. Stopping early.")
+                break
+            continue
+        else:
+            nan_strikes = 0
 
         val_score, recalls, mrr = eval_val_batches(
             motion_clip_model=model,
