@@ -2,16 +2,76 @@ import numpy as np
 import pandas as pd
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import (
+    ReduceLROnPlateau,
+    StepLR,
+    MultiStepLR,
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    OneCycleLR,
+    ExponentialLR,
+)
 
 from clip_train_dataset import ClipDataset, make_collate_fn
 from motion_clip import MotionClip
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Linear warmup wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+class LinearWarmupScheduler:
+    """
+    Linearly ramps LR from `warmup_start_lr` to the optimizer's initial LR
+    over `warmup_epochs` epochs, then hands off to `after_scheduler`.
+
+    Usage:
+        scheduler = LinearWarmupScheduler(opt, warmup_epochs=5, after_scheduler=cosine_sched)
+        # each epoch: scheduler.step()   (pass val_score for plateau)
+    """
+    def __init__(self, optimizer, warmup_epochs: int, after_scheduler,
+                 after_scheduler_kind: str = "epoch",
+                 warmup_start_lr: float = 1e-7):
+        self.optimizer = optimizer
+        self.warmup_epochs = warmup_epochs
+        self.after_scheduler = after_scheduler
+        self.after_scheduler_kind = after_scheduler_kind  # "epoch" | "plateau" | "batch"
+        self.warmup_start_lr = warmup_start_lr
+        self._base_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self._epoch = 0
+        # set initial LR to warmup_start
+        for pg, base in zip(self.optimizer.param_groups, self._base_lrs):
+            pg["lr"] = warmup_start_lr
+
+    @property
+    def in_warmup(self):
+        return self._epoch < self.warmup_epochs
+
+    def step(self, val_score=None):
+        self._epoch += 1
+        if self._epoch <= self.warmup_epochs:
+            frac = self._epoch / max(self.warmup_epochs, 1)
+            for pg, base in zip(self.optimizer.param_groups, self._base_lrs):
+                pg["lr"] = self.warmup_start_lr + frac * (base - self.warmup_start_lr)
+        else:
+            if self.after_scheduler_kind == "plateau":
+                self.after_scheduler.step(val_score)
+            else:
+                self.after_scheduler.step()
+
+    def get_last_lr(self):
+        return [pg["lr"] for pg in self.optimizer.param_groups]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Early stopping
+# ─────────────────────────────────────────────────────────────────────────────
+
 class EarlyStopping:
-    def __init__(self, patience=5, min_delta=0, path='best_model_checkpoint.pth'):
+    def __init__(self, patience=50, min_delta=0.001, path="best_model_checkpoint.pth"):
         self.patience = patience
         self.min_delta = min_delta
         self.path = path
@@ -22,22 +82,25 @@ class EarlyStopping:
     def __call__(self, val_score, model):
         if self.best_score is None:
             self.best_score = val_score
-            self.save_checkpoint(model)
-        # Si le nouveau score n'est pas meilleur que le précédent + delta
+            self._save(model)
         elif val_score < self.best_score + self.min_delta:
             self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            print(f"EarlyStopping counter: {self.counter} out of {self.patience}")
             if self.counter >= self.patience:
                 self.early_stop = True
         else:
             self.best_score = val_score
-            self.save_checkpoint(model)
+            self._save(model)
             self.counter = 0
 
-    def save_checkpoint(self, model):
-        '''Sauvegarde quand le score de validation augmente.'''
+    def _save(self, model):
         torch.save(model.state_dict(), self.path)
         print(f"Modèle sauvegardé (Nouveau meilleur score : {self.best_score:.4f})")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Train / val split
+# ─────────────────────────────────────────────────────────────────────────────
 
 def split_by_motion(motion_ids, val_ratio=0.1, seed=0):
     rng = np.random.default_rng(seed)
@@ -48,13 +111,17 @@ def split_by_motion(motion_ids, val_ratio=0.1, seed=0):
     train_idx = np.sort(idx[n_val:])
     return train_idx, val_idx
 
-#====================================Validation utils=======================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validation utils
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_val_batches(
     motion_ids,
     map_df,
     text_lookup,
     val_indices,
-    n_batches=30,
+    n_batches=100,          # FIX: was 30 – far too noisy; use ≥100
     batch_size=32,
     seed=0,
 ):
@@ -62,9 +129,9 @@ def build_val_batches(
     Creates retrieval-style validation batches using ONLY val_indices.
 
     Returns list of dicts:
-      query_text_tensor_id: int
-      candidate_motion_rows: np.ndarray shape (32,) (indices into motion_ids/motion_paths)
-      gt_index: int (0..31)
+      query_text_tensor_id : int
+      candidate_motion_rows: np.ndarray shape (batch_size,)
+      gt_index             : int (0..batch_size-1)
     """
     rng = np.random.default_rng(seed)
 
@@ -72,7 +139,7 @@ def build_val_batches(
     if len(tid_cols) == 0:
         raise ValueError("map_df must contain at least one column named like 'text_id_1'.")
 
-    mid_to_tids = {}
+    mid_to_tids: dict[int, list[int]] = {}
     for r in map_df.itertuples(index=False):
         tids = []
         for c in tid_cols:
@@ -87,7 +154,9 @@ def build_val_batches(
     eligible = [int(i) for i in val_indices if int(motion_ids[int(i)]) in mid_to_tids]
 
     if len(eligible) < batch_size:
-        raise ValueError(f"Not enough eligible val motions with texts: {len(eligible)} < {batch_size}")
+        raise ValueError(
+            f"Not enough eligible val motions with texts: {len(eligible)} < {batch_size}"
+        )
 
     batches = []
     for _ in range(n_batches):
@@ -95,14 +164,14 @@ def build_val_batches(
         pos_mid = int(motion_ids[pos_row])
         q_tid = int(rng.choice(mid_to_tids[pos_mid]))
 
-        neg_rows = set()
+        neg_rows: set[int] = set()
         while len(neg_rows) < (batch_size - 1):
             r = int(rng.choice(val_indices))
             if r != pos_row:
                 neg_rows.add(r)
-        neg_rows = np.array(list(neg_rows), dtype=np.int64)
+        neg_rows_arr = np.array(list(neg_rows), dtype=np.int64)
 
-        cand_rows = np.concatenate([np.array([pos_row], dtype=np.int64), neg_rows])
+        cand_rows = np.concatenate([np.array([pos_row], dtype=np.int64), neg_rows_arr])
         perm = rng.permutation(batch_size)
         cand_rows = cand_rows[perm]
         gt_index = int(np.where(perm == 0)[0][0])
@@ -114,17 +183,24 @@ def build_val_batches(
                 gt_index=gt_index,
             )
         )
-
     return batches
 
 
 @torch.no_grad()
-def eval_val_batches(motion_clip_model, val_batches, motion_paths, text_emb, device=None, ks=(1, 2, 3, 5, 10)):
+def eval_val_batches(
+    motion_clip_model,
+    val_batches,
+    motion_paths,
+    text_emb,
+    device=None,
+    ks=(1, 2, 3, 5, 10),
+):
     """
-    Lazy validation eval:
-      - loads only the 32 motions per retrieval batch
-      - pads inside the batch
-      - keeps text_emb stored on CPU float16; moves only query embedding to GPU
+    Lazy retrieval-style validation.
+    Returns (composite_score, recalls_dict, mrr).
+
+    composite_score: weighted average of recalls with 1/k weights (original metric).
+    mrr            : Mean Reciprocal Rank – more stable and informative.
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -132,6 +208,7 @@ def eval_val_batches(motion_clip_model, val_batches, motion_paths, text_emb, dev
     motion_clip_model = motion_clip_model.to(device).eval()
 
     recalls = {k: 0 for k in ks}
+    mrr_total = 0.0
     n = len(val_batches)
 
     for b in val_batches:
@@ -139,14 +216,13 @@ def eval_val_batches(motion_clip_model, val_batches, motion_paths, text_emb, dev
         cand_rows = b["candidate_motion_rows"]
         gt = b["gt_index"]
 
-        q = text_emb[q_tid:q_tid+1].to(dtype=torch.float32, device=device)  # (1,E)
+        q = text_emb[q_tid : q_tid + 1].to(dtype=torch.float32, device=device)  # (1,E)
         q = F.normalize(q, dim=-1)
 
-        motions = []
-        lengths = []
+        motions, lengths = [], []
         D = None
         for r in cand_rows:
-            x = np.load(motion_paths[int(r)]).astype(np.float32)  # (T,D)
+            x = np.load(motion_paths[int(r)]).astype(np.float32)
             if D is None:
                 D = x.shape[1]
             lengths.append(x.shape[0])
@@ -154,63 +230,60 @@ def eval_val_batches(motion_clip_model, val_batches, motion_paths, text_emb, dev
 
         T_max = max(lengths)
         motion_pad = torch.zeros((len(motions), T_max, D), dtype=torch.float32)
-        for i, m in enumerate(motions):
-            motion_pad[i, : m.shape[0]] = m
+        for i, mv in enumerate(motions):
+            motion_pad[i, : mv.shape[0]] = mv
         motion_pad = motion_pad.to(device)
 
-        m = F.normalize(motion_clip_model(motion_pad), dim=-1)  # (32,E)
-        sims = (m @ q.t()).squeeze(1)                            # (32,)
-        ranking = torch.argsort(sims, descending=True)
+        m_emb = F.normalize(motion_clip_model(motion_pad), dim=-1)  # (B,E)
+        sims = (m_emb @ q.t()).squeeze(1)                            # (B,)
+        ranking = torch.argsort(sims, descending=True).tolist()
+
+        rank_of_gt = ranking.index(gt) + 1  # 1-based
+        mrr_total += 1.0 / rank_of_gt
 
         for k in ks:
-            if gt in ranking[:k].tolist():
+            if gt in ranking[:k]:
                 recalls[k] += 1
 
     for k in ks:
         recalls[k] /= max(n, 1)
+    mrr = mrr_total / max(n, 1)
 
+    # Composite score (original, kept for compatibility)
     weights = {k: 1.0 / k for k in ks}
     score = sum(weights[k] * recalls[k] for k in ks) / sum(weights.values())
-    return score, recalls
+    return score, recalls, mrr
 
-#======================================LRscheduler====================================================
 
-import torch
-from torch.optim.lr_scheduler import (
-    ReduceLROnPlateau,
-    StepLR,
-    MultiStepLR,
-    CosineAnnealingLR,
-    CosineAnnealingWarmRestarts,
-    OneCycleLR,
-    ExponentialLR,
-)
+# ─────────────────────────────────────────────────────────────────────────────
+# LR scheduler factory
+# ─────────────────────────────────────────────────────────────────────────────
 
 def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
     """
     scheduler_cfg examples:
       None -> no scheduler
-      {"name":"plateau", "mode":"max", "factor":0.5, "patience":2, "min_lr":1e-7}
-      {"name":"step", "step_size":5, "gamma":0.5}
-      {"name":"multistep", "milestones":[10, 20], "gamma":0.1}
-      {"name":"cosine", "T_max":50, "eta_min":1e-6}
-      {"name":"cosine_wr", "T_0":10, "T_mult":2, "eta_min":1e-6}
-      {"name":"exp", "gamma":0.98}
-      {"name":"onecycle", "max_lr":1e-3, "pct_start":0.1}  # needs epochs + steps_per_epoch
-    Returns (scheduler, step_kind) where step_kind in {"none","plateau","epoch","batch"}.
+      {"name":"plateau",    "mode":"max", "factor":0.5, "patience":5}
+      {"name":"step",       "step_size":10, "gamma":0.5}
+      {"name":"multistep",  "milestones":[30,60], "gamma":0.2}
+      {"name":"cosine",     "T_max":50, "eta_min":1e-6}
+      {"name":"cosine_wr",  "T_0":30, "T_mult":2, "eta_min":1e-6}   # ← recommended
+      {"name":"exp",        "gamma":0.98}
+      {"name":"onecycle",   "max_lr":1e-3, "pct_start":0.1}
+
+    Returns (scheduler, step_kind) where step_kind ∈ {"none","plateau","epoch","batch"}.
     """
     if not scheduler_cfg:
         return None, "none"
 
-    cfg = dict(scheduler_cfg)  # copy
+    cfg = dict(scheduler_cfg)
     name = cfg.pop("name").lower()
 
     if name in ("plateau", "reducelronplateau"):
-        cfg.setdefault("mode", "max")   # you maximize val_score
+        cfg.setdefault("mode", "max")
         cfg.setdefault("factor", 0.5)
-        cfg.setdefault("patience", 2)
-        scheduler = ReduceLROnPlateau(opt, **cfg)
-        return scheduler, "plateau"
+        cfg.setdefault("patience", 5)
+        return ReduceLROnPlateau(opt, **cfg), "plateau"
 
     if name in ("step", "steplr"):
         cfg.setdefault("step_size", 10)
@@ -218,21 +291,21 @@ def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
         return StepLR(opt, **cfg), "epoch"
 
     if name in ("multistep", "multisteplr"):
-        cfg.setdefault("milestones", [10, 20])
-        cfg.setdefault("gamma", 0.1)
+        cfg.setdefault("milestones", [30, 60])
+        cfg.setdefault("gamma", 0.2)
         return MultiStepLR(opt, **cfg), "epoch"
 
     if name in ("cosine", "cosineannealinglr"):
         if epochs is None:
-            raise ValueError("cosine scheduler needs epochs (pass epochs to make_scheduler).")
+            raise ValueError("cosine scheduler needs `epochs`.")
         cfg.setdefault("T_max", epochs)
-        cfg.setdefault("eta_min", 0.0)
+        cfg.setdefault("eta_min", 1e-6)
         return CosineAnnealingLR(opt, **cfg), "epoch"
 
     if name in ("cosine_wr", "cosineannealingwarmrestarts"):
-        cfg.setdefault("T_0", 10)
-        cfg.setdefault("T_mult", 1)
-        cfg.setdefault("eta_min", 0.0)
+        cfg.setdefault("T_0", 30)
+        cfg.setdefault("T_mult", 2)
+        cfg.setdefault("eta_min", 1e-6)
         return CosineAnnealingWarmRestarts(opt, **cfg), "epoch"
 
     if name in ("exp", "exponentiallr"):
@@ -241,24 +314,29 @@ def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
 
     if name in ("onecycle", "onecyclelr"):
         if epochs is None or steps_per_epoch is None:
-            raise ValueError("onecycle needs epochs and steps_per_epoch.")
+            raise ValueError("onecycle needs `epochs` and `steps_per_epoch`.")
         cfg.setdefault("max_lr", opt.param_groups[0]["lr"])
-        scheduler = OneCycleLR(opt, epochs=epochs, steps_per_epoch=steps_per_epoch, **cfg)
-        return scheduler, "batch"
+        return OneCycleLR(opt, epochs=epochs, steps_per_epoch=steps_per_epoch, **cfg), "batch"
 
-    raise ValueError(f"Unknown scheduler name: {name}")
+    raise ValueError(f"Unknown scheduler name: '{name}'")
 
 
-#======================================training========================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Loss
+# ─────────────────────────────────────────────────────────────────────────────
 
 def clip_loss(motion_z, text_z, logit_scale):
     motion_z = F.normalize(motion_z, dim=-1)
-    text_z = F.normalize(text_z, dim=-1)
-    scale = logit_scale.exp().clamp(1e-3, 100.0)
-    logits = scale * (motion_z @ text_z.t())  # (B,B)
-    labels = torch.arange(logits.size(0), device=logits.device)
+    text_z   = F.normalize(text_z,   dim=-1)
+    scale    = logit_scale.exp().clamp(1e-3, 100.0)
+    logits   = scale * (motion_z @ text_z.t())          # (B, B)
+    labels   = torch.arange(logits.size(0), device=logits.device)
     return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.t(), labels))
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main training function
+# ─────────────────────────────────────────────────────────────────────────────
 
 def train_clip_with_split(
     motion_model,
@@ -271,13 +349,17 @@ def train_clip_with_split(
     save_path,
     val_ratio=0.1,
     seed=0,
-    epochs=10,
-    batch_size=64,
-    lr=1e-3,                         # cosine start LR
-    weight_decay=1e-4,               # NEW
-    n_val_batches=30,
+    epochs=150,
+    batch_size=128,
+    lr=1e-3,
+    weight_decay=1e-3,          # FIX: was 1e-4 – increase to fight overfitting
+    n_val_batches=100,          # FIX: was 30 – way too noisy; use ≥100
+    val_batch_size=32,          # candidates per retrieval query
     ks=(1, 2, 3, 5, 10),
-    patience=7,
+    patience=50,
+    warmup_epochs=5,            # NEW: linear LR warmup
+    grad_clip=1.0,              # NEW: gradient clipping (set None to disable)
+    logit_scale_max=np.log(100.0),  # NEW: clamp logit_scale after each step
     time_padding=True,
     augs: dict | None = None,
     scheduler_cfg: dict | None = None,
@@ -303,7 +385,6 @@ def train_clip_with_split(
     )
 
     collate_fn = make_collate_fn(pad_collate=time_padding)
-
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -320,7 +401,7 @@ def train_clip_with_split(
         text_lookup=text_lookup,
         val_indices=val_idx,
         n_batches=n_val_batches,
-        batch_size=64,
+        batch_size=val_batch_size,
         seed=seed,
     )
 
@@ -330,19 +411,31 @@ def train_clip_with_split(
         text_model_name=text_model_name,
     ).to(device)
 
-    # optimizer (NEW: weight_decay arg)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # default: cosine from lr to 1e-5 over all epochs
+    # Default scheduler: cosine warm restarts (better than plain cosine for long runs)
     if scheduler_cfg is None:
-        scheduler_cfg = {"name": "cosine", "T_max": epochs, "eta_min": 1e-5}
+        scheduler_cfg = {"name": "cosine_wr", "T_0": 30, "T_mult": 2, "eta_min": 1e-6}
 
-    scheduler, sched_step = make_scheduler(
+    base_scheduler, sched_step = make_scheduler(
         opt,
         scheduler_cfg,
         epochs=epochs,
         steps_per_epoch=len(train_loader),
     )
+
+    # Wrap with linear warmup (only for epoch/plateau schedulers, not onecycle)
+    if warmup_epochs > 0 and sched_step != "batch":
+        scheduler = LinearWarmupScheduler(
+            opt,
+            warmup_epochs=warmup_epochs,
+            after_scheduler=base_scheduler,
+            after_scheduler_kind=sched_step,
+        )
+        effective_sched_step = "warmup"
+    else:
+        scheduler = base_scheduler
+        effective_sched_step = sched_step
 
     early_stopping = EarlyStopping(
         patience=patience,
@@ -351,8 +444,7 @@ def train_clip_with_split(
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
-
-    best = {"val_score": -1.0, "state": None}
+    best = {"val_score": -1.0, "mrr": -1.0, "state": None}
 
     for ep in range(1, epochs + 1):
         model.train()
@@ -371,10 +463,20 @@ def train_clip_with_split(
                 loss = clip_loss(motion_z, texts, model.logit_scale)
 
             scaler.scale(loss).backward()
+
+            # FIX: gradient clipping (unscale first so clip operates on true grads)
+            if grad_clip is not None:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
+
             scaler.step(opt)
             scaler.update()
 
-            if scheduler is not None and sched_step == "batch":
+            # FIX: clamp logit_scale so temperature doesn't collapse
+            with torch.no_grad():
+                model.logit_scale.clamp_(max=logit_scale_max)
+
+            if effective_sched_step == "batch":
                 scheduler.step()
 
             tot += float(loss.item())
@@ -382,7 +484,7 @@ def train_clip_with_split(
 
         train_loss = tot / max(n, 1)
 
-        val_score, recalls = eval_val_batches(
+        val_score, recalls, mrr = eval_val_batches(
             motion_clip_model=model,
             val_batches=val_batches,
             motion_paths=motion_paths,
@@ -391,27 +493,30 @@ def train_clip_with_split(
             ks=ks,
         )
 
-        if scheduler is not None:
-            if sched_step == "plateau":
-                scheduler.step(val_score)
-            elif sched_step == "epoch":
-                scheduler.step()
+        # Scheduler step
+        if effective_sched_step == "warmup":
+            scheduler.step(val_score=val_score if sched_step == "plateau" else None)
+        elif effective_sched_step == "plateau":
+            scheduler.step(val_score)
+        elif effective_sched_step == "epoch":
+            scheduler.step()
 
-        r_str = " ".join([f"R@{k}={recalls[k]:.3f}" for k in ks])
         current_lr = opt.param_groups[0]["lr"]
-        lr_str = f"{current_lr:.2e}"
-
+        r_str = " ".join([f"R@{k}={recalls[k]:.3f}" for k in ks])
         print(
-            f"epoch {ep:03d}/{epochs:03d} | lr={lr_str} | "
-            f"train_loss={train_loss:.4f} | val_score={val_score:.4f} | {r_str}"
+            f"epoch {ep:03d}/{epochs:03d} | lr={current_lr:.2e} | "
+            f"train_loss={train_loss:.4f} | val_score={val_score:.4f} | "
+            f"MRR={mrr:.4f} | {r_str}"
         )
 
+        # Track best by MRR (more stable) but also keep composite score for compat
         early_stopping(val_score, model)
 
         if float(val_score) > best["val_score"]:
             best["val_score"] = float(val_score)
+            best["mrr"] = float(mrr)
             best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            print("Found New Best Model!")
+            print(f"Found New Best Model! (MRR={mrr:.4f})")
 
         if early_stopping.early_stop:
             print(f"Early stopping at epoch {ep}.")
@@ -425,10 +530,6 @@ def train_clip_with_split(
         "val_idx": val_idx,
         "val_batches": val_batches,
         "best_val_score": best["val_score"],
+        "best_mrr": best["mrr"],
         "scheduler_cfg": scheduler_cfg,
     }
-
-
-
-
-
