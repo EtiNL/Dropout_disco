@@ -53,22 +53,34 @@ class ClipDataset(Dataset):
         return torch.from_numpy(x), tvec
 
 
-def _pad_collate(batch):
+def make_collate_fn(pad_collate: bool = True):
     """
-    Pads motions within the batch only (memory-friendly).
-    Returns:
-      motions: (B, T_max, D) float32
-      texts  : (B, E) float32
+    If pad_collate=True:
+      motions are padded to (B, T_max, D) and returned as float32 tensor.
+
+    If pad_collate=False:
+      motions are returned as a Python list of (T_i, D) float32 tensors
+      (variable-length), and texts as (B, E) float32 tensor.
+      Use this if your model can handle variable-length sequences without padding.
     """
-    motions, texts = zip(*batch)
-    lengths = [m.shape[0] for m in motions]
-    T_max = max(lengths)
-    D = motions[0].shape[1]
+    def _pad(batch):
+        motions, texts = zip(*batch)
+        lengths = [m.shape[0] for m in motions]
+        T_max = max(lengths)
+        D = motions[0].shape[1]
 
-    motion_pad = torch.zeros((len(motions), T_max, D), dtype=torch.float32)
-    for i, m in enumerate(motions):
-        motion_pad[i, : m.shape[0]] = m
+        motion_pad = torch.zeros((len(motions), T_max, D), dtype=torch.float32)
+        for i, m in enumerate(motions):
+            motion_pad[i, : m.shape[0]] = m
 
-    texts = torch.stack(texts, dim=0)
-    return motion_pad, texts
+        texts_t = torch.stack(texts, dim=0)
+        return motion_pad, texts_t
 
+    def _nopad(batch):
+        motions, texts = zip(*batch)
+        # ensure float32 motions (already are, but keep invariant)
+        motions = [m.to(dtype=torch.float32) for m in motions]
+        texts_t = torch.stack(texts, dim=0)
+        return motions, texts_t
+
+    return _pad if pad_collate else _nopad
