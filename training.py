@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from clip_train_dataset import ClipDataset, _pad_collate
+from clip_train_dataset import ClipDataset, make_collate_fn
 from motion_clip import MotionClip
 
 
@@ -189,7 +189,8 @@ def train_clip_with_split(
     map_df,
     text_df,
     text_emb,
-    text_model_name="BAAI/bge-m3",
+    text_model_name,
+    save_path,
     val_ratio=0.1,
     seed=0,
     epochs=10,
@@ -197,11 +198,11 @@ def train_clip_with_split(
     lr=1e-4,
     n_val_batches=30,
     ks=(1, 2, 3, 5, 10),
-    patience = 7
+    patience=7,
+    time_padding=True,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # lookup text_id -> text_tensor_id
     if "text_tensor_id" not in text_df.columns:
         text_df = text_df.copy().reset_index(drop=True)
         text_df["text_tensor_id"] = np.arange(len(text_df), dtype=np.int64)
@@ -217,13 +218,16 @@ def train_clip_with_split(
         text_emb=text_emb,
         indices=train_idx,
     )
+
+    collate_fn = make_collate_fn(pad_collate=time_padding)
+
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
         num_workers=2,
-        collate_fn=_pad_collate,
+        collate_fn=collate_fn,
         pin_memory=(device == "cuda"),
     )
 
@@ -249,7 +253,7 @@ def train_clip_with_split(
     early_stopping = EarlyStopping(
         patience=patience,
         min_delta=0.001,
-        path='best_lstm_clip.pth'
+        path=save_path,            # UPDATED
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
@@ -257,12 +261,15 @@ def train_clip_with_split(
     best = {"val_score": -1.0, "state": None}
 
     for ep in range(1, epochs + 1):
-        # ---- train ----
         model.train()
         tot, n = 0.0, 0
 
         for motions, texts in train_loader:
-            motions = motions.to(device, non_blocking=True)
+            if time_padding:
+                motions = motions.to(device, non_blocking=True)
+            else:
+                motions = [m.to(device, non_blocking=True) for m in motions]
+
             texts = texts.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
@@ -279,7 +286,6 @@ def train_clip_with_split(
 
         train_loss = tot / max(n, 1)
 
-        # ---- validate ----
         val_score, recalls = eval_val_batches(
             motion_clip_model=model,
             val_batches=val_batches,
@@ -290,15 +296,14 @@ def train_clip_with_split(
         )
 
         r_str = " ".join([f"R@{k}={recalls[k]:.3f}" for k in ks])
-        current_lr = opt.param_groups[0]['lr']
-
-
-        print(f"epoch {ep}/{epochs} | lr={current_lr:.6f} | train_loss={train_loss:.4f} | val_score={val_score:.4f} | {r_str}")
+        current_lr = opt.param_groups[0]["lr"]
+        print(
+            f"epoch {ep}/{epochs} | lr={current_lr:.6f} | "
+            f"train_loss={train_loss:.4f} | val_score={val_score:.4f} | {r_str}"
+        )
 
         scheduler.step(val_score)
-
         early_stopping(val_score, model)
-
 
         if val_score > best["val_score"]:
             best["val_score"] = val_score
@@ -306,11 +311,17 @@ def train_clip_with_split(
             print("Found New Best Model!")
 
         if early_stopping.early_stop:
-          print(f"Early stopping déclenché à l'époque {ep}. Arrêt de l'entraînement.")
-          break
+            print(f"Early stopping déclenché à l'époque {ep}. Arrêt de l'entraînement.")
+            break
 
     if best["state"] is not None:
         model.load_state_dict(best["state"])
 
-    return model, {"train_idx": train_idx, "val_idx": val_idx, "val_batches": val_batches, "best_val_score": best["val_score"]}
+    return model, {
+        "train_idx": train_idx,
+        "val_idx": val_idx,
+        "val_batches": val_batches,
+        "best_val_score": best["val_score"],
+    }
+
 
