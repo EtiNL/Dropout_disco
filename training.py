@@ -68,15 +68,20 @@ def build_val_batches(
     """
     rng = np.random.default_rng(seed)
 
+    tid_cols = [c for c in map_df.columns if c.startswith("text_id_")]
+    if len(tid_cols) == 0:
+        raise ValueError("map_df must contain at least one column named like 'text_id_1'.")
+
     mid_to_tids = {}
     for r in map_df.itertuples(index=False):
         tids = []
-        for tid in (r.text_id_1, r.text_id_2, r.text_id_3):
+        for c in tid_cols:
+            tid = getattr(r, c)
             if pd.isna(tid):
                 continue
             tids.append(int(text_lookup[tid]))
         if len(tids) > 0:
-            mid_to_tids[int(r.motion_id)] = tids
+            mid_to_tids[int(getattr(r, "motion_id"))] = tids
 
     val_indices = np.array([int(i) for i in val_indices], dtype=np.int64)
     eligible = [int(i) for i in val_indices if int(motion_ids[int(i)]) in mid_to_tids]
@@ -200,6 +205,7 @@ def train_clip_with_split(
     ks=(1, 2, 3, 5, 10),
     patience=7,
     time_padding=True,
+    augs: dict | None = None,   # NEW
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -217,6 +223,8 @@ def train_clip_with_split(
         text_lookup=text_lookup,
         text_emb=text_emb,
         indices=train_idx,
+        augs=augs,                # NEW
+        seed=seed,                # keep deterministic augmentation stream if desired
     )
 
     collate_fn = make_collate_fn(pad_collate=time_padding)
@@ -253,7 +261,7 @@ def train_clip_with_split(
     early_stopping = EarlyStopping(
         patience=patience,
         min_delta=0.001,
-        path=save_path,            # UPDATED
+        path=save_path,
     )
 
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))

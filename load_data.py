@@ -4,21 +4,37 @@ from os.path import join as pjoin
 import pandas as pd
 
 
-def load_train_data(data_root: str = "./"):
+def load_train_data(
+    data_root: str = "./data",
+    augmented_text: bool = False,
+    n_desc_per_motion: int | None = None,
+):
     """
-    Memory-friendly version:
-      - does NOT build a giant padded motion_tensor
-      - returns motion_paths instead
+    Args:
+      data_root: dataset root containing motions/ and texts/ (and optionally augmented_texts/)
+      augmented_text: if True, reads text files from {data_root}/augmented_texts/augmented_texts
+                      otherwise reads from {data_root}/texts/texts
+      n_desc_per_motion: number of descriptions to keep per motion in map_df.
+                         Defaults to 6 if augmented_text=True, else 3.
 
     Returns:
       motion_ids   : list[int]
       motion_paths : list[str] (aligned with motion_ids)
-      map_df       : DataFrame [motion_id, text_id_1, text_id_2, text_id_3]
+      map_df       : DataFrame [motion_id, text_id_1, ..., text_id_{n_desc_per_motion}]
       text_df      : DataFrame [text_id, motion_id, description]
     """
     motion_dir = pjoin(data_root, "motions", "motions")
-    text_dir = pjoin(data_root, "texts", "texts")
+    text_dir = (
+        pjoin(data_root, "augmented_texts", "augmented_texts")
+        if augmented_text
+        else pjoin(data_root, "texts", "texts")
+    )
     train_list = pjoin(data_root, "train.txt")
+
+    if n_desc_per_motion is None:
+        n_desc_per_motion = 6 if augmented_text else 3
+    if n_desc_per_motion <= 0:
+        raise ValueError("n_desc_per_motion must be a positive integer.")
 
     with open(train_list, "r", encoding="utf-8") as f:
         motion_ids = [int(x) for x in f.read().splitlines() if x.strip()]
@@ -39,11 +55,15 @@ def load_train_data(data_root: str = "./"):
             tids.append(tid)
             text_rows.append({"text_id": tid, "motion_id": mid, "description": desc})
 
-        chosen = (tids + [pd.NA, pd.NA, pd.NA])[:3]
-        map_rows.append({"motion_id": mid, "text_id_1": chosen[0], "text_id_2": chosen[1], "text_id_3": chosen[2]})
+        chosen = (tids + [pd.NA] * n_desc_per_motion)[:n_desc_per_motion]
+        row = {"motion_id": mid}
+        for j in range(n_desc_per_motion):
+            row[f"text_id_{j+1}"] = chosen[j]
+        map_rows.append(row)
 
     text_df = pd.DataFrame(text_rows, columns=["text_id", "motion_id", "description"])
-    map_df = pd.DataFrame(map_rows, columns=["motion_id", "text_id_1", "text_id_2", "text_id_3"])
+
+    map_cols = ["motion_id"] + [f"text_id_{j+1}" for j in range(n_desc_per_motion)]
+    map_df = pd.DataFrame(map_rows, columns=map_cols)
 
     return motion_ids, motion_paths, map_df, text_df
-
