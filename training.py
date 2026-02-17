@@ -176,7 +176,15 @@ def eval_val_batches(motion_clip_model, val_batches, motion_paths, text_emb, dev
 #======================================LRscheduler====================================================
 
 import torch
-from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR, MultiStepLR, CosineAnnealingLR, CosineAnnealingWarmRestarts, OneCycleLR, ExponentialLR
+from torch.optim.lr_scheduler import (
+    ReduceLROnPlateau,
+    StepLR,
+    MultiStepLR,
+    CosineAnnealingLR,
+    CosineAnnealingWarmRestarts,
+    OneCycleLR,
+    ExponentialLR,
+)
 
 def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
     """
@@ -198,8 +206,7 @@ def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
     name = cfg.pop("name").lower()
 
     if name in ("plateau", "reducelronplateau"):
-        # default for your case: maximize val_score
-        cfg.setdefault("mode", "max")
+        cfg.setdefault("mode", "max")   # you maximize val_score
         cfg.setdefault("factor", 0.5)
         cfg.setdefault("patience", 2)
         scheduler = ReduceLROnPlateau(opt, **cfg)
@@ -244,8 +251,6 @@ def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
 
 #======================================training========================================================
 
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-
 def clip_loss(motion_z, text_z, logit_scale):
     motion_z = F.normalize(motion_z, dim=-1)
     text_z = F.normalize(text_z, dim=-1)
@@ -268,26 +273,24 @@ def train_clip_with_split(
     seed=0,
     epochs=10,
     batch_size=64,
-    lr=1e-4,
+    lr=1e-3,                         # cosine start LR
+    weight_decay=1e-4,               # NEW
     n_val_batches=30,
     ks=(1, 2, 3, 5, 10),
     patience=7,
     time_padding=True,
     augs: dict | None = None,
-    scheduler_cfg: dict | None = None,   # NEW
+    scheduler_cfg: dict | None = None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # lookup text_id -> text_tensor_id
     if "text_tensor_id" not in text_df.columns:
         text_df = text_df.copy().reset_index(drop=True)
         text_df["text_tensor_id"] = np.arange(len(text_df), dtype=np.int64)
     text_lookup = dict(zip(text_df["text_id"], text_df["text_tensor_id"]))
 
-    # split
     train_idx, val_idx = split_by_motion(motion_ids, val_ratio=val_ratio, seed=seed)
 
-    # datasets / loaders
     train_ds = ClipDataset(
         motion_ids=motion_ids,
         motion_paths=motion_paths,
@@ -311,29 +314,29 @@ def train_clip_with_split(
         pin_memory=(device == "cuda"),
     )
 
-    # pre-built val batches (your existing helper)
     val_batches = build_val_batches(
         motion_ids=motion_ids,
         map_df=map_df,
         text_lookup=text_lookup,
         val_indices=val_idx,
         n_batches=n_val_batches,
-        batch_size=32,
+        batch_size=64,
         seed=seed,
     )
 
-    # model
     model = MotionClip(
         motion_model=motion_model,
         text_dim=text_emb.shape[1],
         text_model_name=text_model_name,
     ).to(device)
 
-    # optimizer
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # optimizer (NEW: weight_decay arg)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # scheduler (NEW)
-    # Requires make_scheduler(opt, scheduler_cfg, epochs=..., steps_per_epoch=...) defined elsewhere.
+    # default: cosine from lr to 1e-5 over all epochs
+    if scheduler_cfg is None:
+        scheduler_cfg = {"name": "cosine", "T_max": epochs, "eta_min": 1e-5}
+
     scheduler, sched_step = make_scheduler(
         opt,
         scheduler_cfg,
@@ -341,7 +344,6 @@ def train_clip_with_split(
         steps_per_epoch=len(train_loader),
     )
 
-    # early stopping (maximize val_score)
     early_stopping = EarlyStopping(
         patience=patience,
         min_delta=0.001,
@@ -361,7 +363,6 @@ def train_clip_with_split(
                 motions = motions.to(device, non_blocking=True)
             else:
                 motions = [m.to(device, non_blocking=True) for m in motions]
-
             texts = texts.to(device, non_blocking=True)
 
             opt.zero_grad(set_to_none=True)
@@ -373,7 +374,6 @@ def train_clip_with_split(
             scaler.step(opt)
             scaler.update()
 
-            # scheduler step per-batch (e.g., OneCycleLR)
             if scheduler is not None and sched_step == "batch":
                 scheduler.step()
 
@@ -382,7 +382,6 @@ def train_clip_with_split(
 
         train_loss = tot / max(n, 1)
 
-        # validation
         val_score, recalls = eval_val_batches(
             motion_clip_model=model,
             val_batches=val_batches,
@@ -392,7 +391,6 @@ def train_clip_with_split(
             ks=ks,
         )
 
-        # scheduler step per-epoch / plateau
         if scheduler is not None:
             if sched_step == "plateau":
                 scheduler.step(val_score)
@@ -401,17 +399,15 @@ def train_clip_with_split(
 
         r_str = " ".join([f"R@{k}={recalls[k]:.3f}" for k in ks])
         current_lr = opt.param_groups[0]["lr"]
-        lr_str = f"{current_lr:.2e}"  # e.g. 1.00e-04
+        lr_str = f"{current_lr:.2e}"
+
         print(
             f"epoch {ep:03d}/{epochs:03d} | lr={lr_str} | "
             f"train_loss={train_loss:.4f} | val_score={val_score:.4f} | {r_str}"
         )
 
-
-        # early stopping
         early_stopping(val_score, model)
 
-        # keep best in RAM too (optional but convenient)
         if float(val_score) > best["val_score"]:
             best["val_score"] = float(val_score)
             best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
@@ -429,7 +425,10 @@ def train_clip_with_split(
         "val_idx": val_idx,
         "val_batches": val_batches,
         "best_val_score": best["val_score"],
+        "scheduler_cfg": scheduler_cfg,
     }
+
+
 
 
 
