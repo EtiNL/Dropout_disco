@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class GRUMotionEncoder(nn.Module):
-    def __init__(self, d_in: int, hidden_dim: int = 512, out_dim: int = 512, num_layers: int = 2):
+    def __init__(self, d_in, hidden_dim = 512, out_dim = 512, num_layers = 2):
         super().__init__()
         
         self.gru = nn.GRU(
@@ -20,9 +20,9 @@ class GRUMotionEncoder(nn.Module):
             nn.Linear(hidden_dim, out_dim)
         )
 
-    def forward(self, motions: torch.Tensor) -> torch.Tensor:
+    def forward(self, motions):
 
-        output, _ = self.gru(motions)
+        output, v = self.gru(motions)
         
         mask = (motions.abs().sum(dim=-1) > 0).float().unsqueeze(-1)
 
