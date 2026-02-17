@@ -173,6 +173,74 @@ def eval_val_batches(motion_clip_model, val_batches, motion_paths, text_emb, dev
     score = sum(weights[k] * recalls[k] for k in ks) / sum(weights.values())
     return score, recalls
 
+#======================================LRscheduler====================================================
+
+import torch
+from torch.optim.lr_scheduler import ReduceLROnPlateau, StepLR, MultiStepLR, CosineAnnealingLR, CosineAnnealingWarmRestarts, OneCycleLR, ExponentialLR
+
+def make_scheduler(opt, scheduler_cfg, epochs=None, steps_per_epoch=None):
+    """
+    scheduler_cfg examples:
+      None -> no scheduler
+      {"name":"plateau", "mode":"max", "factor":0.5, "patience":2, "min_lr":1e-7}
+      {"name":"step", "step_size":5, "gamma":0.5}
+      {"name":"multistep", "milestones":[10, 20], "gamma":0.1}
+      {"name":"cosine", "T_max":50, "eta_min":1e-6}
+      {"name":"cosine_wr", "T_0":10, "T_mult":2, "eta_min":1e-6}
+      {"name":"exp", "gamma":0.98}
+      {"name":"onecycle", "max_lr":1e-3, "pct_start":0.1}  # needs epochs + steps_per_epoch
+    Returns (scheduler, step_kind) where step_kind in {"none","plateau","epoch","batch"}.
+    """
+    if not scheduler_cfg:
+        return None, "none"
+
+    cfg = dict(scheduler_cfg)  # copy
+    name = cfg.pop("name").lower()
+
+    if name in ("plateau", "reducelronplateau"):
+        # default for your case: maximize val_score
+        cfg.setdefault("mode", "max")
+        cfg.setdefault("factor", 0.5)
+        cfg.setdefault("patience", 2)
+        scheduler = ReduceLROnPlateau(opt, **cfg)
+        return scheduler, "plateau"
+
+    if name in ("step", "steplr"):
+        cfg.setdefault("step_size", 10)
+        cfg.setdefault("gamma", 0.1)
+        return StepLR(opt, **cfg), "epoch"
+
+    if name in ("multistep", "multisteplr"):
+        cfg.setdefault("milestones", [10, 20])
+        cfg.setdefault("gamma", 0.1)
+        return MultiStepLR(opt, **cfg), "epoch"
+
+    if name in ("cosine", "cosineannealinglr"):
+        if epochs is None:
+            raise ValueError("cosine scheduler needs epochs (pass epochs to make_scheduler).")
+        cfg.setdefault("T_max", epochs)
+        cfg.setdefault("eta_min", 0.0)
+        return CosineAnnealingLR(opt, **cfg), "epoch"
+
+    if name in ("cosine_wr", "cosineannealingwarmrestarts"):
+        cfg.setdefault("T_0", 10)
+        cfg.setdefault("T_mult", 1)
+        cfg.setdefault("eta_min", 0.0)
+        return CosineAnnealingWarmRestarts(opt, **cfg), "epoch"
+
+    if name in ("exp", "exponentiallr"):
+        cfg.setdefault("gamma", 0.99)
+        return ExponentialLR(opt, **cfg), "epoch"
+
+    if name in ("onecycle", "onecyclelr"):
+        if epochs is None or steps_per_epoch is None:
+            raise ValueError("onecycle needs epochs and steps_per_epoch.")
+        cfg.setdefault("max_lr", opt.param_groups[0]["lr"])
+        scheduler = OneCycleLR(opt, epochs=epochs, steps_per_epoch=steps_per_epoch, **cfg)
+        return scheduler, "batch"
+
+    raise ValueError(f"Unknown scheduler name: {name}")
+
 
 #======================================training========================================================
 
@@ -205,17 +273,21 @@ def train_clip_with_split(
     ks=(1, 2, 3, 5, 10),
     patience=7,
     time_padding=True,
-    augs: dict | None = None,   # NEW
+    augs: dict | None = None,
+    scheduler_cfg: dict | None = None,   # NEW
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # lookup text_id -> text_tensor_id
     if "text_tensor_id" not in text_df.columns:
         text_df = text_df.copy().reset_index(drop=True)
         text_df["text_tensor_id"] = np.arange(len(text_df), dtype=np.int64)
     text_lookup = dict(zip(text_df["text_id"], text_df["text_tensor_id"]))
 
+    # split
     train_idx, val_idx = split_by_motion(motion_ids, val_ratio=val_ratio, seed=seed)
 
+    # datasets / loaders
     train_ds = ClipDataset(
         motion_ids=motion_ids,
         motion_paths=motion_paths,
@@ -223,8 +295,8 @@ def train_clip_with_split(
         text_lookup=text_lookup,
         text_emb=text_emb,
         indices=train_idx,
-        augs=augs,                # NEW
-        seed=seed,                # keep deterministic augmentation stream if desired
+        augs=augs,
+        seed=seed,
     )
 
     collate_fn = make_collate_fn(pad_collate=time_padding)
@@ -239,6 +311,7 @@ def train_clip_with_split(
         pin_memory=(device == "cuda"),
     )
 
+    # pre-built val batches (your existing helper)
     val_batches = build_val_batches(
         motion_ids=motion_ids,
         map_df=map_df,
@@ -249,15 +322,26 @@ def train_clip_with_split(
         seed=seed,
     )
 
+    # model
     model = MotionClip(
         motion_model=motion_model,
         text_dim=text_emb.shape[1],
         text_model_name=text_model_name,
     ).to(device)
 
+    # optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=2)
 
+    # scheduler (NEW)
+    # Requires make_scheduler(opt, scheduler_cfg, epochs=..., steps_per_epoch=...) defined elsewhere.
+    scheduler, sched_step = make_scheduler(
+        opt,
+        scheduler_cfg,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+    )
+
+    # early stopping (maximize val_score)
     early_stopping = EarlyStopping(
         patience=patience,
         min_delta=0.001,
@@ -289,11 +373,16 @@ def train_clip_with_split(
             scaler.step(opt)
             scaler.update()
 
+            # scheduler step per-batch (e.g., OneCycleLR)
+            if scheduler is not None and sched_step == "batch":
+                scheduler.step()
+
             tot += float(loss.item())
             n += 1
 
         train_loss = tot / max(n, 1)
 
+        # validation
         val_score, recalls = eval_val_batches(
             motion_clip_model=model,
             val_batches=val_batches,
@@ -303,23 +392,33 @@ def train_clip_with_split(
             ks=ks,
         )
 
+        # scheduler step per-epoch / plateau
+        if scheduler is not None:
+            if sched_step == "plateau":
+                scheduler.step(val_score)
+            elif sched_step == "epoch":
+                scheduler.step()
+
         r_str = " ".join([f"R@{k}={recalls[k]:.3f}" for k in ks])
         current_lr = opt.param_groups[0]["lr"]
+        lr_str = f"{current_lr:.2e}"  # e.g. 1.00e-04
         print(
-            f"epoch {ep}/{epochs} | lr={current_lr:.6f} | "
+            f"epoch {ep:03d}/{epochs:03d} | lr={lr_str} | "
             f"train_loss={train_loss:.4f} | val_score={val_score:.4f} | {r_str}"
         )
 
-        scheduler.step(val_score)
+
+        # early stopping
         early_stopping(val_score, model)
 
-        if val_score > best["val_score"]:
-            best["val_score"] = val_score
+        # keep best in RAM too (optional but convenient)
+        if float(val_score) > best["val_score"]:
+            best["val_score"] = float(val_score)
             best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
             print("Found New Best Model!")
 
         if early_stopping.early_stop:
-            print(f"Early stopping déclenché à l'époque {ep}. Arrêt de l'entraînement.")
+            print(f"Early stopping at epoch {ep}.")
             break
 
     if best["state"] is not None:
@@ -331,5 +430,6 @@ def train_clip_with_split(
         "val_batches": val_batches,
         "best_val_score": best["val_score"],
     }
+
 
 
