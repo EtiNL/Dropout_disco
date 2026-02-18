@@ -1,3 +1,4 @@
+# motion_clip.py
 import numpy as np
 
 import torch
@@ -15,6 +16,7 @@ class MotionClip(nn.Module):
         self.logit_scale = nn.Parameter(torch.tensor(np.log(1 / 0.07), dtype=torch.float32))
 
     def forward(self, motions, **motion_kwargs):
+        # Forward any kwargs (e.g., lengths=...) to the motion encoder
         z = self.motion_model(motions, **motion_kwargs)  # (B,M)
         if z.ndim != 2:
             raise ValueError(f"motion_model must return (B, M). Got {z.shape}.")
