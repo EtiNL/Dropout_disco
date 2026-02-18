@@ -3,11 +3,12 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
-from data_augmentation import aug_rotate_y, aug_translate_xz
+from data_augmentation import aug_rotate_y, aug_translate_xz, aug_noise
 
 AUG_REGISTRY = {
     "translate_xz": aug_translate_xz,
     "rotate_y": aug_rotate_y,
+    "noise": aug_noise,
 }
 
 def compute_stats_safe(motion_paths):

@@ -60,3 +60,13 @@ def aug_rotate_y(
     m[:, P1_POS] = _rot_block(m[:, P1_POS])
     m[:, P2_POS] = _rot_block(m[:, P2_POS])
     return m
+
+def aug_window(x, rng, window_size=240):
+    T = x.shape[0]
+    if T <= window_size:
+        return x
+    start = rng.integers(0, T - window_size)
+    return x[start : start + window_size]
+
+def aug_noise(x, rng, scale=0.005):
+    return x + rng.normal(scale=scale, size=x.shape).astype(np.float32)
