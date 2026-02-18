@@ -20,9 +20,7 @@ def timestep_embedding(timesteps, dim, max_period=10000):
         embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
     return embedding
 
-
 class StylizationBlock(nn.Module):
-    """Injecte l'information de temps ou de style dans les couches."""
     def __init__(self, latent_dim, time_embed_dim, dropout):
         super().__init__()
         self.emb_layers = nn.Sequential(
@@ -33,7 +31,7 @@ class StylizationBlock(nn.Module):
         self.out_layers = nn.Sequential(
             nn.SiLU(),
             nn.Dropout(p=dropout),
-            zero_module(nn.Linear(latent_dim, latent_dim)),
+            nn.Linear(latent_dim, latent_dim),
         )
 
     def forward(self, h, emb):
@@ -57,12 +55,12 @@ class LinearTemporalSelfAttention(nn.Module):
         B, T, D = x.shape
         H = self.num_head
         query = self.query(self.norm(x))
+        # Utilisation du masque pour que l'attention ignore le padding
         key = (self.key(self.norm(x)) + (1 - src_mask) * -1000000)
         query = F.softmax(query.view(B, T, H, -1), dim=-1)
         key = F.softmax(key.view(B, T, H, -1), dim=1)
         value = (self.value(self.norm(x)) * src_mask).view(B, T, H, -1)
         
-        # Attention Linéaire (O(T) au lieu de O(T²))
         attention = torch.einsum('bnhd,bnhl->bhdl', key, value)
         y = torch.einsum('bnhd,bhdl->bnhl', query, attention).reshape(B, T, D)
         return x + self.proj_out(y, emb)
@@ -96,7 +94,7 @@ class FFN(nn.Module):
     def __init__(self, latent_dim, ffn_dim, dropout, time_embed_dim):
         super().__init__()
         self.linear1 = nn.Linear(latent_dim, ffn_dim)
-        self.linear2 = zero_module(nn.Linear(ffn_dim, latent_dim))
+        self.linear2 = nn.Linear(ffn_dim, latent_dim)
         self.activation = nn.GELU()
         self.dropout = nn.Dropout(dropout)
         self.proj_out = StylizationBlock(latent_dim, time_embed_dim, dropout)
@@ -118,14 +116,11 @@ class DecoderLayer(nn.Module):
         x = self.ffn(x, emb)
         return x
 
-
 class DiffusionTransformerEncoder(nn.Module):
     def __init__(self, input_feats=384, latent_dim=512, num_layers=8, num_heads=8, ff_size=1024):
         super().__init__()
         self.latent_dim = latent_dim
         self.joint_embed = nn.Linear(input_feats, latent_dim)
-        
-        # Encodage sinusoïdal dynamique
         self.register_buffer('pos_encoding', self._get_sinusoidal_encoding(5000, latent_dim))
         
         self.time_embed_dim = latent_dim * 4
@@ -151,26 +146,27 @@ class DiffusionTransformerEncoder(nn.Module):
         pe[:, 1::2] = torch.cos(position * div_term)
         return pe.unsqueeze(0)
 
-    def forward(self, x, text_emb=None):
+    def forward(self, x, text_emb=None, lengths=None):
         B, T, _ = x.shape
         device = x.device
+
+        if lengths is None:
+            lengths = torch.full((B,), T, dtype=torch.long, device=device)
         
-        # Style / Time embedding
+        grid = torch.arange(T, device=device).unsqueeze(0) # (1, T)
+        src_mask = (grid < lengths.unsqueeze(1)).float().unsqueeze(-1) # (B, T, 1)
+        
         timesteps = torch.zeros(B, device=device).long()
         emb = self.time_embed(timestep_embedding(timesteps, self.latent_dim))
         
-        # Projection initiale
         h = self.joint_embed(x)
         h = h + self.pos_encoding[:, :T, :]
         
-        src_mask = torch.ones(B, T, 1, device=device)
-        
-        # Passage dans les blocs (Chaque frame regarde le texte et les autres frames)
         for block in self.blocks:
-            # Si text_emb est (B, 512), on l'unsqueeze en (B, 1, 512)
             xf = text_emb.unsqueeze(1) if text_emb is not None else h
             h = block(h, xf, emb, src_mask)
-            
-        # Pooling temporel pour le Retrieval
-        z = h.mean(dim=1)
+        
+        h = h * src_mask 
+        z = h.sum(dim=1) / lengths.unsqueeze(1).float()
+        
         return self.out_proj(self.out_ln(z))
