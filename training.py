@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 
@@ -447,9 +448,9 @@ def train_clip_with_split(
         path=save_path,
     )
 
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+    scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
     best = {"val_score": -1.0, "mrr": -1.0, "state": None}
-    nan_strikes = 0          # consecutive NaN-contaminated epochs
+    nan_strikes = 0
     MAX_NAN_STRIKES = 3
 
     for ep in range(1, epochs + 1):
@@ -464,24 +465,29 @@ def train_clip_with_split(
                 motions = [m.to(device, non_blocking=True) for m in motions]
             texts = texts.to(device, non_blocking=True)
 
+            # ── Clamp logit_scale BEFORE forward so AMP never sees inf/NaN ────
+            # This is the root fix: logit_scale.exp() overflows to inf under
+            # float16 if the value is large, poisoning motion_z and the loss.
+            with torch.no_grad():
+                model.logit_scale.nan_to_num_(nan=np.log(1 / 0.07))  # reset if already NaN
+                model.logit_scale.clamp_(0.0, logit_scale_max)
+
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device == "cuda")):
+            with torch.amp.autocast("cuda", enabled=(device == "cuda")):
                 motion_z = model(motions)
                 loss = clip_loss(motion_z, texts, model.logit_scale)
 
             # ── NaN/Inf guard: check BEFORE backward so weights stay clean ────
             if not torch.isfinite(loss):
                 nan_in_epoch = True
-                # Diagnose the source so we can fix it upstream
                 with torch.no_grad():
                     mz_ok = torch.isfinite(motion_z).all().item()
                     tz_ok = torch.isfinite(texts).all().item()
                     ls_val = model.logit_scale.item()
                 print(f"  [NaN] ep={ep} | motion_z_finite={mz_ok} | "
-                      f"text_finite={tz_ok} | logit_scale={ls_val:.3f}")
+                      f"text_finite={tz_ok} | logit_scale={ls_val:.4f}")
                 opt.zero_grad(set_to_none=True)
-                # Reset scaler to avoid stale state after skipped backward
-                scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda"))
+                scaler = torch.amp.GradScaler("cuda", enabled=(device == "cuda"))
                 continue
 
             scaler.scale(loss).backward()
@@ -494,10 +500,6 @@ def train_clip_with_split(
             scaler.step(opt)
             scaler.update()
 
-            # Clamp logit_scale so temperature doesn't collapse
-            with torch.no_grad():
-                model.logit_scale.clamp_(max=logit_scale_max)
-
             if effective_sched_step == "batch":
                 scheduler.step()
 
@@ -506,17 +508,18 @@ def train_clip_with_split(
 
         train_loss = tot / max(n, 1)
 
-        # ── NaN epoch recovery: any NaN seen → reload best weights, halve LR ─
-        # We do this regardless of how many batches succeeded, because even one
-        # NaN loss means motion_z or logit_scale produced inf/nan outputs and
-        # the model state may already be partially corrupted.
+        # ── NaN epoch recovery: reload from disk checkpoint (guaranteed clean) ─
         if nan_in_epoch:
             nan_strikes += 1
-            print(f"⚠️  NaN detected in epoch {ep} (strike {nan_strikes}/{MAX_NAN_STRIKES}). "
-                  f"Reloading best weights and halving LR.")
-            if best["state"] is not None:
-                model.load_state_dict(best["state"])
+            print(f"⚠️  NaN in epoch {ep} (strike {nan_strikes}/{MAX_NAN_STRIKES}). "
+                  f"Reloading checkpoint from disk and halving LR.")
+            # Load from disk, not from best["state"] which may also be corrupted
+            if os.path.exists(save_path):
+                model.load_state_dict(torch.load(save_path, map_location=device))
                 model = model.to(device)
+                # Re-initialise best["state"] from the clean disk checkpoint
+                best["state"] = {k: v.detach().cpu().clone()
+                                 for k, v in model.state_dict().items()}
             for pg in opt.param_groups:
                 pg["lr"] = max(pg["lr"] * 0.5, 1e-7)
             if nan_strikes >= MAX_NAN_STRIKES:
@@ -555,10 +558,14 @@ def train_clip_with_split(
         early_stopping(val_score, model)
 
         if float(val_score) > best["val_score"]:
-            best["val_score"] = float(val_score)
-            best["mrr"] = float(mrr)
-            best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            print(f"Found New Best Model! (MRR={mrr:.4f})")
+            # Only save if logit_scale is healthy — NaN logit_scale would
+            # corrupt the in-memory checkpoint and poison recovery.
+            ls_healthy = torch.isfinite(model.logit_scale).item()
+            if ls_healthy:
+                best["val_score"] = float(val_score)
+                best["mrr"] = float(mrr)
+                best["state"] = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                print(f"Found New Best Model! (MRR={mrr:.4f})")
 
         if early_stopping.early_stop:
             print(f"Early stopping at epoch {ep}.")
