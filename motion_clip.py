@@ -14,8 +14,8 @@ class MotionClip(nn.Module):
         self._in_dim = None
         self.logit_scale = nn.Parameter(torch.tensor(np.log(1 / 0.07), dtype=torch.float32))
 
-    def forward(self, motions):
-        z = self.motion_model(motions)  # (B,M)
+    def forward(self, motions, **motion_kwargs):
+        z = self.motion_model(motions, **motion_kwargs)  # (B,M)
         if z.ndim != 2:
             raise ValueError(f"motion_model must return (B, M). Got {z.shape}.")
         if self._in_dim is None:

@@ -235,7 +235,9 @@ def eval_val_batches(
             motion_pad[i, : mv.shape[0]] = mv
         motion_pad = motion_pad.to(device)
 
-        m_emb = F.normalize(motion_clip_model(motion_pad), dim=-1)  # (B,E)
+        lengths_t = torch.tensor(lengths, dtype=torch.long, device=device)
+        m_emb = F.normalize(motion_clip_model(motion_pad, lengths=lengths_t), dim=-1)
+
         sims = (m_emb @ q.t()).squeeze(1)                            # (B,)
         ranking = torch.argsort(sims, descending=True).tolist()
 
@@ -458,11 +460,22 @@ def train_clip_with_split(
         tot, n = 0.0, 0
         nan_in_epoch = False
 
-        for motions, texts in train_loader:
+        for batch in train_loader:
+            if len(batch) == 2:
+                motions, texts = batch
+                lengths = None
+            else:
+                motions, lengths, texts = batch
+
             if time_padding:
                 motions = motions.to(device, non_blocking=True)
+                if lengths is not None:
+                    lengths = lengths.to(device, non_blocking=True)
             else:
                 motions = [m.to(device, non_blocking=True) for m in motions]
+                if lengths is not None:
+                    lengths = lengths.to(device, non_blocking=True)
+
             texts = texts.to(device, non_blocking=True)
 
             # ── Clamp logit_scale BEFORE forward so AMP never sees inf/NaN ────
@@ -472,7 +485,7 @@ def train_clip_with_split(
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=(device == "cuda")):
-                motion_z = model(motions)
+                motion_z = model(motions, lengths=lengths)
 
             # ── Check motion_z BEFORE computing loss so we catch GRU NaNs early ─
             if not torch.isfinite(motion_z).all():
