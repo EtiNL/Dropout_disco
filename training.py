@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import (
     ExponentialLR,
 )
 
-from clip_train_dataset import ClipDataset, make_collate_fn
+from clip_train_dataset import ClipDataset, make_collate_fn, compute_stats_safe
 from motion_clip import MotionClip
 
 
@@ -193,6 +193,8 @@ def eval_val_batches(
     val_batches,
     motion_paths,
     text_emb,
+    mean, 
+    std,
     device=None,
     ks=(1, 2, 3, 5, 10),
 ):
@@ -207,6 +209,9 @@ def eval_val_batches(
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     motion_clip_model = motion_clip_model.to(device).eval()
+    
+    mean_t = torch.tensor(mean).to(device).float()
+    std_t = torch.tensor(std).to(device).float()
 
     recalls = {k: 0 for k in ks}
     mrr_total = 0.0
@@ -226,11 +231,15 @@ def eval_val_batches(
             x = np.load(motion_paths[int(r)]).astype(np.float32)
             if D is None:
                 D = x.shape[1]
-            lengths.append(x.shape[0])
-            motions.append(torch.from_numpy(x))
+            
+            x_tensor = torch.from_numpy(x).to(device)
+            x_norm = (x_tensor - mean_t) / std_t
+            
+            lengths.append(x_norm.shape[0])
+            motions.append(x_norm)
 
         T_max = max(lengths)
-        motion_pad = torch.zeros((len(motions), T_max, D), dtype=torch.float32)
+        motion_pad = torch.zeros((len(motions), T_max, D), dtype=torch.float32, device=device)
         for i, mv in enumerate(motions):
             motion_pad[i, : mv.shape[0]] = mv
         motion_pad = motion_pad.to(device)
@@ -375,6 +384,9 @@ def train_clip_with_split(
     text_lookup = dict(zip(text_df["text_id"], text_df["text_tensor_id"]))
 
     train_idx, val_idx = split_by_motion(motion_ids, val_ratio=val_ratio, seed=seed)
+    
+    train_paths_only = [motion_paths[i] for i in train_idx]
+    mean, std = compute_stats_safe(train_paths_only)
 
     train_ds = ClipDataset(
         motion_ids=motion_ids,
@@ -383,6 +395,8 @@ def train_clip_with_split(
         text_lookup=text_lookup,
         text_emb=text_emb,
         indices=train_idx,
+        mean=mean,
+        std=std,
         augs=augs,
         seed=seed,
     )
@@ -551,6 +565,8 @@ def train_clip_with_split(
             val_batches=val_batches,
             motion_paths=motion_paths,
             text_emb=text_emb,
+            mean = mean,
+            std = std,
             device=device,
             ks=ks,
         )

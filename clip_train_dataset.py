@@ -10,6 +10,23 @@ AUG_REGISTRY = {
     "rotate_y": aug_rotate_y,
 }
 
+def compute_stats_safe(motion_paths):
+    sum_x = np.zeros(384)
+    sum_sq_x = np.zeros(384)
+    total_frames = 0
+    
+    for path in motion_paths:
+        motion = np.load(path)  
+        sum_x += np.sum(motion, axis=0)
+        sum_sq_x += np.sum(motion**2, axis=0)
+        total_frames += motion.shape[0]
+    
+    mean = sum_x / total_frames
+    var = (sum_sq_x / total_frames) - (mean ** 2)
+    std = np.sqrt(np.maximum(var, 1e-8))
+    
+    std[std < 1e-5] = 1.0  
+    return mean, std
 
 class ClipDataset(Dataset):
     """
@@ -28,6 +45,8 @@ class ClipDataset(Dataset):
         text_lookup,
         text_emb,
         indices,
+        mean, 
+        std,
         augs: dict | None = None,
         seed: int | None = None,
     ):
@@ -36,6 +55,9 @@ class ClipDataset(Dataset):
         self.text_emb = text_emb  # CPU float16
         self.augs = augs or {}
         self.rng = np.random.default_rng(seed)
+        
+        self.mean = torch.tensor(mean).float()
+        self.std = torch.tensor(std).float()
 
         tid_cols = [c for c in map_df.columns if c.startswith("text_id_")]
         if len(tid_cols) == 0:
@@ -84,11 +106,14 @@ class ClipDataset(Dataset):
 
         # apply augmentations (NumPy-side)
         x = self._apply_augs(x)
+        
+        x = torch.from_numpy(x)
+        x = (x - self.mean) / self.std
 
         tid = tids[self.rng.integers(len(tids))]
         tvec = self.text_emb[tid].to(dtype=torch.float32)
 
-        return torch.from_numpy(x), tvec
+        return x, tvec
 
 
 def make_collate_fn(pad_collate: bool = True):
