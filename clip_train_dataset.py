@@ -33,7 +33,7 @@ class ClipDataset(Dataset):
     ):
         self.motion_ids = motion_ids
         self.motion_paths = motion_paths
-        self.text_emb = text_emb  # CPU float16
+        self.text_emb = text_emb  # CPU float16/float32
         self.augs = augs or {}
         self.rng = np.random.default_rng(seed)
 
@@ -92,10 +92,23 @@ class ClipDataset(Dataset):
 
 
 def make_collate_fn(pad_collate: bool = True):
+    """
+    If pad_collate=True:
+      returns (motion_pad, lengths, texts_t)
+        motion_pad: (B, T_max, D) float32
+        lengths  : (B,) long, true lengths (<= T_max)
+        texts_t  : (B, E) float32
+
+    If pad_collate=False:
+      returns (motions_list, lengths, texts_t)
+        motions_list: list of (T_i, D) float32 tensors
+        lengths     : (B,) long
+        texts_t     : (B, E) float32
+    """
 
     def _pad(batch):
         motions, texts = zip(*batch)
-        lengths = torch.tensor([m.shape[0] for m in motions], dtype=torch.long)  # (B,)
+        lengths = torch.tensor([m.shape[0] for m in motions], dtype=torch.long)
         T_max = int(lengths.max().item())
         D = motions[0].shape[1]
 
@@ -108,10 +121,9 @@ def make_collate_fn(pad_collate: bool = True):
 
     def _nopad(batch):
         motions, texts = zip(*batch)
-        lengths = torch.tensor([m.shape[0] for m in motions], dtype=torch.long)  # (B,)
+        lengths = torch.tensor([m.shape[0] for m in motions], dtype=torch.long)
         motions = [m.to(dtype=torch.float32) for m in motions]
         texts_t = torch.stack(texts, dim=0)
         return motions, lengths, texts_t
 
     return _pad if pad_collate else _nopad
-
