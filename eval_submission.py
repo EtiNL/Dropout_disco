@@ -136,7 +136,8 @@ def build_submission_df(
         if M.ndim == 1:
             M = M.unsqueeze(0)
 
-        M = F.normalize(M, dim=-1).to(dtype=torch.float32)
+        M = F.normalize(M, dim=-1).to(device=device, dtype=torch.float32)
+        q = q.to(device=device, dtype=torch.float32)
 
         # similarity + topk
         sims = (M @ q.t()).squeeze(1)  # [Nm]
