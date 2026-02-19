@@ -104,6 +104,9 @@ def build_submission_df(
             m = re.search(r"(\d+)$", base)
             motion_nums.append(int(m.group(1)) if m else base)
 
+        # record true lengths before any padding
+        lengths = torch.tensor([m.shape[0] for m in motions], dtype=torch.long)
+
         # stack or pad (padding assumes [T, C] if variable length)
         try:
             motion_batch = torch.stack(motions, dim=0)
@@ -121,12 +124,13 @@ def build_submission_df(
             motion_batch = torch.stack(padded, dim=0)
 
         motion_batch = motion_batch.to(device=device, dtype=torch.float32)
+        lengths = lengths.to(device=device)
 
         # motion embeddings (fp32)
         if encode_motion is not None:
             M = encode_motion(motion_batch)
         else:
-            M = motion_clip_model(motion_batch)
+            M = motion_clip_model(motion_batch, lengths=lengths)
 
         if M.ndim == 1:
             M = M.unsqueeze(0)
