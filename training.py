@@ -16,7 +16,7 @@ from torch.optim.lr_scheduler import (
     ExponentialLR,
 )
 
-from clip_train_dataset import ClipDataset, make_collate_fn, compute_stats_safe
+from clip_train_dataset import ClipDataset, make_collate_fn
 from motion_clip import MotionClip
 
 
