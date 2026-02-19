@@ -34,6 +34,8 @@ def make_st_text_encoder(model_name, device):
 @torch.no_grad()
 def build_submission_df(
     motion_clip_model,
+    mean, 
+    std,
     test_root="./data/test",
     top_k=10,
     device=None,
@@ -54,6 +56,9 @@ def build_submission_df(
             device = next(motion_clip_model.parameters()).device
         except StopIteration:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
+    mean_t = torch.tensor(mean).to(device).float()
+    std_t = torch.tensor(std).to(device).float()
 
     if not hasattr(motion_clip_model, "text_model_name"):
         raise AttributeError("motion_clip_model must have attribute text_model_name.")
@@ -97,6 +102,8 @@ def build_submission_df(
                 t = t.float()
             else:
                 t = t.to(dtype=torch.float32)
+            
+            t = (t - mean_t) / std_t
 
             motions.append(t)
 

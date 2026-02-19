@@ -25,14 +25,6 @@ from motion_clip import MotionClip
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LinearWarmupScheduler:
-    """
-    Linearly ramps LR from `warmup_start_lr` to the optimizer's initial LR
-    over `warmup_epochs` epochs, then hands off to `after_scheduler`.
-
-    Usage:
-        scheduler = LinearWarmupScheduler(opt, warmup_epochs=5, after_scheduler=cosine_sched)
-        # each epoch: scheduler.step()   (pass val_score for plateau)
-    """
     def __init__(self, optimizer, warmup_epochs: int, after_scheduler,
                  after_scheduler_kind: str = "epoch",
                  warmup_start_lr: float = 1e-7):
@@ -41,31 +33,33 @@ class LinearWarmupScheduler:
         self.after_scheduler = after_scheduler
         self.after_scheduler_kind = after_scheduler_kind  # "epoch" | "plateau" | "batch"
         self.warmup_start_lr = warmup_start_lr
-        self._base_lrs = [pg["lr"] for pg in optimizer.param_groups]
-        self._epoch = 0
-        # set initial LR to warmup_start
-        for pg, base in zip(self.optimizer.param_groups, self._base_lrs):
+        
+        self._target_lrs = [pg["lr"] for pg in optimizer.param_groups]
+        self._current_epoch = 0
+        
+        for pg in self.optimizer.param_groups:
             pg["lr"] = warmup_start_lr
 
     @property
     def in_warmup(self):
-        return self._epoch < self.warmup_epochs
+        return self._current_epoch < self.warmup_epochs
 
     def step(self, val_score=None):
-        self._epoch += 1
-        if self._epoch <= self.warmup_epochs:
-            frac = self._epoch / max(self.warmup_epochs, 1)
-            for pg, base in zip(self.optimizer.param_groups, self._base_lrs):
-                pg["lr"] = self.warmup_start_lr + frac * (base - self.warmup_start_lr)
+        if self._current_epoch < self.warmup_epochs:
+            self._current_epoch += 1
+            frac = self._current_epoch / float(self.warmup_epochs)
+            
+            for pg, target_lr in zip(self.optimizer.param_groups, self._target_lrs):
+                pg["lr"] = self.warmup_start_lr + frac * (target_lr - self.warmup_start_lr)
         else:
             if self.after_scheduler_kind == "plateau":
                 self.after_scheduler.step(val_score)
             else:
                 self.after_scheduler.step()
+            self._current_epoch += 1
 
     def get_last_lr(self):
         return [pg["lr"] for pg in self.optimizer.param_groups]
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Early stopping
