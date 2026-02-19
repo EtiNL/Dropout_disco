@@ -60,3 +60,25 @@ def aug_rotate_y(
     m[:, P1_POS] = _rot_block(m[:, P1_POS])
     m[:, P2_POS] = _rot_block(m[:, P2_POS])
     return m
+
+def aug_swap_persons(
+    m: np.ndarray,
+    rng: np.random.Generator,
+    p: float = 0.5,
+) -> np.ndarray:
+    """
+    Swap data between person 1 and person 2.
+    Assumes each person has 'HALF' (192) dimensions.
+    """
+    if rng.random() >= p:
+        return m
+
+    m_swapped = m.copy()
+    
+    p1_data = m[:, :HALF].copy()
+    p2_data = m[:, HALF:].copy()
+    
+    m_swapped[:, :HALF] = p2_data
+    m_swapped[:, HALF:] = p1_data
+    
+    return m_swapped
