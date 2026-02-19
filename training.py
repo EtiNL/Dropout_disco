@@ -200,6 +200,8 @@ def train_clip_with_split(
     ks=(1, 2, 3, 5, 10),
     patience=7,
     time_padding=True,
+    weight_decay=1e-4,
+    scheduler_cfg=None
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -247,8 +249,11 @@ def train_clip_with_split(
         text_model_name=text_model_name,
     ).to(device)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(opt, mode="max", factor=0.5, patience=2)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    if scheduler_cfg:
+        scheduler = ReduceLROnPlateau(opt, **scheduler_cfg)
+    else:
+        scheduler = ReduceLROnPlateau(opt, mode="max", factor=0.8, patience=3)
 
     early_stopping = EarlyStopping(
         patience=patience,
