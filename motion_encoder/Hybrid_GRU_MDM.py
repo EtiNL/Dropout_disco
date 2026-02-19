@@ -12,12 +12,14 @@ class HybridMotionEncoder(nn.Module):
         # GRU branch
         gru_hidden_dim: int = 512,
         gru_out_dim: int = 512,
-        # MDM branch — default matches standalone MDM config
+        # MDM branch
         mdm_latent_dim: int = 512,
         mdm_nhead: int = 8,
-        mdm_num_layers: int = 6,
-        mdm_ff_dim: int = 2048,
-        mdm_dropout: float = 0.1,
+        mdm_num_layers: int = 4,
+        mdm_ff_dim: int = 1024,
+        mdm_dropout: float = 0.2,
+        # Fusion head
+        fusion_dropout: float = 0.3,
     ):
         super().__init__()
 
@@ -39,7 +41,7 @@ class HybridMotionEncoder(nn.Module):
         self.fusion_proj = nn.Sequential(
             nn.Linear(fused_dim, fused_dim),
             nn.GELU(),
-            nn.Dropout(mdm_dropout),
+            nn.Dropout(fusion_dropout),
             nn.Linear(fused_dim, text_out_dim),
         )
 
