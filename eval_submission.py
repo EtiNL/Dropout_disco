@@ -124,7 +124,8 @@ def build_submission_df(
             motion_batch = torch.stack(padded, dim=0)
 
         motion_batch = motion_batch.to(device=device, dtype=torch.float32)
-        lengths = lengths.to(device=device)
+        # lengths stays on CPU: pack_padded_sequence (used by GRU) requires CPU lengths.
+        # HybridMotionEncoder moves lengths to the right device internally for MDM.
 
         # motion embeddings (fp32)
         if encode_motion is not None:
